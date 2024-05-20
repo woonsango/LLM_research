@@ -17,6 +17,8 @@ import time
 import pandas as pd
 import numpy as np
 from huggingface_hub import interpreter_login
+from datasets import DatasetDict
+
 
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from functools import partial
@@ -29,34 +31,47 @@ def dataset_load(huggingface_dataset_name):
     #data set 다운
     dataset = load_dataset(huggingface_dataset_name)
 
+    # 기존 DatasetDict 로드 또는 정의
+    dataset_dict = dataset
+    
+    # 'train' 데이터셋을 'train'과 'temp'로 분할 (예: 70% 'train', 30% 'temp')
+    train_testsplit = dataset_dict['train'].train_test_split(test_size=0.3)
+    
+    # 'temp'를 'validation'과 'test'로 분할 (예: 각각 'temp'의 50%, 총 데이터셋의 15%)
+    val_testsplit = train_testsplit['test'].train_test_split(test_size=0.5)
+    
+    # 새로운 DatasetDict 생성
+    dataset = DatasetDict({
+        'train': train_testsplit['train'],  # 70% 데이터
+        'validation': val_testsplit['train'],  # 15% 데이터
+        'test': val_testsplit['test']  # 나머지 15% 데이터
+    })
+
     return dataset
 
 def tokenizer_fun(tokenizer_name):
     '''
         토크나이저를 설정하는 함수
     '''
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name,trust_remote_code=True,padding_side="left",add_eos_token=True,add_bos_token=True,use_fast=False)
+    tokenizer_ko = AutoTokenizer.from_pretrained("EleutherAI/polyglot-ko-5.8b",trust_remote_code=True,padding_side="right", padding=True,add_eos_token=True,add_bos_token=True,use_fast=False)
     #tokenizer.pad_token = tokenizer.eos_token: 이 부분은 패딩 토큰을 EOS (End-Of-Sequence) 토큰으로 설정합니다. 이렇게 하면 모델이 패딩을 식별하는 데 사용되는 토큰을 EOS 토큰으로 사용하게 됩니다.
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer_ko.pad_token = tokenizer_ko.eos_token
 
-    return tokenizer
+    return tokenizer_ko
 
-def gen(model_name, prompt, max_length, tokenizer):
-    '''
-        model의 output을 만드는 함수
-    '''
+def gen_ko(model_name, prompt, max_length):
     # 입력 텍스트를 토크나이즈하고 모델에 입력할 형식으로 변환
-    input_ids = tokenizer_ko.encode(prompt, return_tensors="pt", truncation=True)
+    input_ids = tokenizer_ko.encode(prompt, max_length=max_length, padding=True, return_tensors="pt", truncation=True, return_attention_mask=True)
     
     # 모델에 입력하여 텍스트 생성
-    outputs = model_name.generate(input_ids, max_length=max_length)
+    outputs = model_name.generate(input_ids.to('cuda'), max_length=max_length,pad_token_id=tokenizer_ko.eos_token_id)
 
     # print(len(outputs))
     # print(outputs)
     
     
     # 생성된 텍스트 디코딩
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    generated_text = tokenizer_ko.decode(outputs[0], skip_special_tokens=True)
     
     return generated_text
 
@@ -183,7 +198,7 @@ if __name__ == "__main__" :
             bnb_4bit_use_double_quant=False,
         )
 
-    model_name='./peft-ko-training-1710709331/checkpoint-600'
+    model_name='microsoft/phi-2'
     device_map = {"": 0}
     #모델을 양자화하여 다운(or load)
     original_model = AutoModelForCausalLM.from_pretrained(model_name, 
@@ -225,7 +240,7 @@ if __name__ == "__main__" :
     
     peft_model = get_peft_model(original_model, config)
 
-    output_dir = f'./peft-ko-training-{str(int(time.time()))}'
+    output_dir = f'./model/peft-ko-training-{str(int(time.time()))}'
     import transformers
     
     peft_training_args = TrainingArguments(
@@ -233,10 +248,10 @@ if __name__ == "__main__" :
         warmup_steps=1,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
-        max_steps=400,
+        max_steps=1000,
         learning_rate=2e-4,
         optim="paged_adamw_8bit",
-        logging_steps=25,
+        logging_steps=5,
         logging_dir="./logs",
         save_strategy="steps",
         save_steps=25,
@@ -245,7 +260,7 @@ if __name__ == "__main__" :
         do_eval=True,
         gradient_checkpointing=True,
         report_to="none",
-        overwrite_output_dir = 'True',
+        overwrite_output_dir = True,
         group_by_length=True,
     )
     
@@ -254,7 +269,7 @@ if __name__ == "__main__" :
     peft_trainer = transformers.Trainer(
         model=peft_model,
         train_dataset=train_dataset['train'],
-        eval_dataset=train_dataset['train'],
+        eval_dataset=train_dataset['validation'],
         args=peft_training_args,
         data_collator=transformers.DataCollatorForLanguageModeling(tokenizer_ko, mlm=False),
     )
